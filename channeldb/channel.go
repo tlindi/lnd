@@ -242,6 +242,8 @@ type chanAuxData struct {
 	memo tlv.OptionalRecordT[tlv.TlvType5, []byte]
 
 	tapscriptRoot tlv.OptionalRecordT[tlv.TlvType6, [32]byte]
+
+	customBlob tlv.OptionalRecordT[tlv.TlvType7, tlv.Blob]
 }
 
 // encode serializes the chanAuxData to the given io.Writer.
@@ -257,6 +259,9 @@ func (c *chanAuxData) encode(w io.Writer) error {
 	})
 	c.tapscriptRoot.WhenSome(func(root tlv.RecordT[tlv.TlvType6, [32]byte]) { //nolint:lll
 		tlvRecords = append(tlvRecords, root.Record())
+	})
+	c.customBlob.WhenSome(func(blob tlv.RecordT[tlv.TlvType7, tlv.Blob]) {
+		tlvRecords = append(tlvRecords, blob.Record())
 	})
 
 	// Create the tlv stream.
@@ -276,6 +281,7 @@ func (c *chanAuxData) encode(w io.Writer) error {
 func (c *chanAuxData) decode(r io.Reader) error {
 	memo := c.memo.Zero()
 	tapscriptRoot := c.tapscriptRoot.Zero()
+	blob := c.customBlob.Zero()
 
 	// Create the tlv stream.
 	tlvStream, err := tlv.NewStream(
@@ -285,6 +291,7 @@ func (c *chanAuxData) decode(r io.Reader) error {
 		c.realScid.Record(),
 		memo.Record(),
 		tapscriptRoot.Record(),
+		blob.Record(),
 	)
 	if err != nil {
 		return err
@@ -300,6 +307,9 @@ func (c *chanAuxData) decode(r io.Reader) error {
 	}
 	if _, ok := tlvs[tapscriptRoot.TlvType()]; ok {
 		c.tapscriptRoot = tlv.SomeRecordT(tapscriptRoot)
+	}
+	if _, ok := tlvs[c.customBlob.TlvType()]; ok {
+		c.customBlob = tlv.SomeRecordT(blob)
 	}
 
 	return nil
@@ -317,6 +327,9 @@ func (c *chanAuxData) toOpenChan(o *OpenChannel) {
 	})
 	c.tapscriptRoot.WhenSomeV(func(h [32]byte) {
 		o.TapscriptRoot = fn.Some(chainhash.Hash(h))
+	})
+	c.customBlob.WhenSomeV(func(blob tlv.Blob) {
+		o.CustomBlob = fn.Some(blob)
 	})
 }
 
@@ -345,6 +358,11 @@ func newChanAuxDataFromChan(openChan *OpenChannel) *chanAuxData {
 	openChan.TapscriptRoot.WhenSome(func(h chainhash.Hash) {
 		c.tapscriptRoot = tlv.SomeRecordT(
 			tlv.NewPrimitiveRecord[tlv.TlvType6]([32]byte(h)),
+		)
+	})
+	openChan.CustomBlob.WhenSome(func(blob tlv.Blob) {
+		c.customBlob = tlv.SomeRecordT(
+			tlv.NewPrimitiveRecord[tlv.TlvType7](blob),
 		)
 	})
 
@@ -974,6 +992,12 @@ type OpenChannel struct {
 	// TapscriptRoot is an optional tapscript root used to derive the
 	// musig2 funding output.
 	TapscriptRoot fn.Option[chainhash.Hash]
+
+	// CustomBlob is an optional blob that can be used to store information
+	// specific to a custom channel type. This information is only created
+	// at channel funding time, and after wards is to be considered
+	// immutable.
+	CustomBlob fn.Option[tlv.Blob]
 
 	// TODO(roasbeef): eww
 	Db *ChannelStateDB
