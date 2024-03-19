@@ -337,6 +337,7 @@ func createTestChannelState(t *testing.T, cdb *ChannelStateDB) *OpenChannel {
 			FeePerKw:      btcutil.Amount(5000),
 			CommitTx:      channels.TestFundingTx,
 			CommitSig:     bytes.Repeat([]byte{1}, 71),
+			CustomBlob:    fn.Some([]byte{1, 2, 3}),
 		},
 		RemoteCommitment: ChannelCommitment{
 			CommitHeight:  0,
@@ -346,6 +347,7 @@ func createTestChannelState(t *testing.T, cdb *ChannelStateDB) *OpenChannel {
 			FeePerKw:      btcutil.Amount(5000),
 			CommitTx:      channels.TestFundingTx,
 			CommitSig:     bytes.Repeat([]byte{1}, 71),
+			CustomBlob:    fn.Some([]byte{4, 5, 6}),
 		},
 		NumConfsRequired:        4,
 		RemoteCurrentRevocation: privKey.PubKey(),
@@ -359,7 +361,6 @@ func createTestChannelState(t *testing.T, cdb *ChannelStateDB) *OpenChannel {
 		InitialLocalBalance:     lnwire.MilliSatoshi(9000),
 		InitialRemoteBalance:    lnwire.MilliSatoshi(3000),
 		TapscriptRoot:           fn.Some(tapscriptRoot),
-		CustomBlob:              fn.Some([]byte{1, 2, 3}),
 	}
 }
 
@@ -649,6 +650,7 @@ func TestChannelStateTransition(t *testing.T) {
 		CommitTx:        newTx,
 		CommitSig:       newSig,
 		Htlcs:           htlcs,
+		CustomBlob:      fn.Some([]byte{4, 5, 6}),
 	}
 
 	// First update the local node's broadcastable state and also add a
