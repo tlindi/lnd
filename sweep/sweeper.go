@@ -3,11 +3,8 @@ package sweep
 import (
 	"errors"
 	"fmt"
-	"math/rand"
-	"sort"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
@@ -224,14 +221,6 @@ func (p *pendingInput) terminated() bool {
 // pendingInputs is a type alias for a set of pending inputs.
 type pendingInputs = map[wire.OutPoint]*pendingInput
 
-// inputCluster is a helper struct to gather a set of pending inputs that should
-// be swept with the specified fee rate.
-type inputCluster struct {
-	lockTime     *uint32
-	sweepFeeRate chainfee.SatPerKWeight
-	inputs       pendingInputs
-}
-
 // pendingSweepsReq is an internal message we'll use to represent an external
 // caller's intent to retrieve all of the pending inputs the UtxoSweeper is
 // attempting to sweep.
@@ -328,12 +317,6 @@ type UtxoSweeperConfig struct {
 	// Wallet contains the wallet functions that sweeper requires.
 	Wallet Wallet
 
-	// TickerDuration is used to create a channel that will be sent on when
-	// a certain time window has passed. During this time window, new
-	// inputs can still be added to the sweep tx that is about to be
-	// generated.
-	TickerDuration time.Duration
-
 	// Notifier is an instance of a chain notifier we'll use to watch for
 	// certain on-chain events.
 	Notifier chainntnfs.ChainNotifier
@@ -352,7 +335,7 @@ type UtxoSweeperConfig struct {
 	// MaxInputsPerTx specifies the default maximum number of inputs allowed
 	// in a single sweep tx. If more need to be swept, multiple txes are
 	// created and published.
-	MaxInputsPerTx int
+	MaxInputsPerTx uint32
 
 	// MaxSweepAttempts specifies the maximum number of times an input is
 	// included in a publish attempt before giving up and returning an error
@@ -631,12 +614,6 @@ func (s *UtxoSweeper) collector(blockEpochs <-chan *chainntnfs.BlockEpoch) {
 		return
 	}
 
-	// Create a ticker based on the config duration.
-	ticker := time.NewTicker(s.cfg.TickerDuration)
-	defer ticker.Stop()
-
-	log.Debugf("Sweep ticker started")
-
 	for {
 		// Clean inputs, which will remove inputs that are swept,
 		// failed, or excluded from the sweeper and return inputs that
@@ -650,6 +627,13 @@ func (s *UtxoSweeper) collector(blockEpochs <-chan *chainntnfs.BlockEpoch) {
 		// a listener to spend and schedule a sweep.
 		case input := <-s.newInputs:
 			s.handleNewInput(input)
+
+			// If this input is forced, we perform an sweep
+			// immediately.
+			if input.params.Force {
+				inputs = s.updateSweeperInputs()
+				s.sweepPendingInputs(inputs)
+			}
 
 		// A spend of one of our inputs is detected. Signal sweep
 		// results to the caller(s).
@@ -670,14 +654,6 @@ func (s *UtxoSweeper) collector(blockEpochs <-chan *chainntnfs.BlockEpoch) {
 				err:        err,
 			}
 
-		// The timer expires and we are going to (re)sweep.
-		case <-ticker.C:
-			log.Debugf("Sweep ticker ticks, attempt sweeping %d "+
-				"inputs", len(inputs))
-
-			// Sweep the remaining pending inputs.
-			s.sweepPendingInputs(inputs)
-
 		// A new block comes in, update the bestHeight.
 		//
 		// TODO(yy): this is where we check our published transactions
@@ -685,13 +661,22 @@ func (s *UtxoSweeper) collector(blockEpochs <-chan *chainntnfs.BlockEpoch) {
 		// bumper to get an updated fee rate.
 		case epoch, ok := <-blockEpochs:
 			if !ok {
+				// We should stop the sweeper before stopping
+				// the chain service. Otherwise it indicates an
+				// error.
+				log.Error("Block epoch channel closed")
+
 				return
 			}
 
+			// Update the sweeper to the best height.
 			s.currentHeight = epoch.Height
 
-			log.Debugf("New block: height=%v, sha=%v",
-				epoch.Height, epoch.Hash)
+			log.Debugf("Received new block: height=%v, attempt "+
+				"sweeping %d inputs", epoch.Height, len(inputs))
+
+			// Attempt to sweep any pending inputs.
+			s.sweepPendingInputs(inputs)
 
 		case <-s.quit:
 			return
@@ -747,70 +732,6 @@ func (s *UtxoSweeper) removeExclusiveGroup(group uint64) {
 	}
 }
 
-// sweepCluster tries to sweep the given input cluster.
-func (s *UtxoSweeper) sweepCluster(cluster inputCluster) error {
-	// Execute the sweep within a coin select lock. Otherwise the coins
-	// that we are going to spend may be selected for other transactions
-	// like funding of a channel.
-	return s.cfg.Wallet.WithCoinSelectLock(func() error {
-		// Examine pending inputs and try to construct lists of inputs.
-		allSets, newSets, err := s.getInputLists(cluster)
-		if err != nil {
-			return fmt.Errorf("examine pending inputs: %w", err)
-		}
-
-		// errAllSets records the error from broadcasting the sweeping
-		// transactions for all input sets.
-		var errAllSets error
-
-		// allSets contains retried inputs and new inputs. To avoid
-		// creating an RBF for the new inputs, we'd sweep this set
-		// first.
-		for _, inputs := range allSets {
-			errAllSets = s.sweep(inputs, cluster.sweepFeeRate)
-			// TODO(yy): we should also find out which set created
-			// this error. If there are new inputs in this set, we
-			// should give it a second chance by sweeping them
-			// below. To enable this, we need to provide richer
-			// state for each input other than just recording the
-			// publishAttempts. We'd also need to refactor how we
-			// create the input sets. Atm, the steps are,
-			// 1. create a list of input sets.
-			// 2. sweep each set by creating and publishing the tx.
-			// We should change the flow as,
-			// 1. create a list of input sets, and for each set,
-			// 2. when created, we create and publish the tx.
-			// 3. if the publish fails, find out which input is
-			//    causing the failure and retry the rest of the
-			//    inputs.
-			if errAllSets != nil {
-				log.Errorf("Sweep all inputs got error: %v",
-					errAllSets)
-				break
-			}
-		}
-
-		// If we have successfully swept all inputs, there's no need to
-		// sweep the new inputs as it'd create an RBF case.
-		if allSets != nil && errAllSets == nil {
-			return nil
-		}
-
-		// We'd end up there if there's no retried inputs or the above
-		// sweeping tx failed. In this case, we'd sweep the new input
-		// sets. If there's an error when sweeping a given set, we'd
-		// log the error and sweep the next set.
-		for _, inputs := range newSets {
-			err := s.sweep(inputs, cluster.sweepFeeRate)
-			if err != nil {
-				log.Errorf("sweep new inputs: %w", err)
-			}
-		}
-
-		return nil
-	})
-}
-
 // signalResult notifies the listeners of the final result of the input sweep.
 // It also cancels any pending spend notification.
 func (s *UtxoSweeper) signalResult(pi *pendingInput, result Result) {
@@ -842,81 +763,9 @@ func (s *UtxoSweeper) signalResult(pi *pendingInput, result Result) {
 	}
 }
 
-// getInputLists goes through the given inputs and constructs multiple distinct
-// sweep lists with the given fee rate, each up to the configured maximum
-// number of inputs. Negative yield inputs are skipped. Transactions with an
-// output below the dust limit are not published. Those inputs remain pending
-// and will be bundled with future inputs if possible. It returns two list -
-// one containing all inputs and the other containing only the new inputs. If
-// there's no retried inputs, the first set returned will be empty.
-func (s *UtxoSweeper) getInputLists(
-	cluster inputCluster) ([]inputSet, []inputSet, error) {
-
-	// Filter for inputs that need to be swept. Create two lists: all
-	// sweepable inputs and a list containing only the new, never tried
-	// inputs.
-	//
-	// We want to create as large a tx as possible, so we return a final
-	// set list that starts with sets created from all inputs. However,
-	// there is a chance that those txes will not publish, because they
-	// already contain inputs that failed before. Therefore we also add
-	// sets consisting of only new inputs to the list, to make sure that
-	// new inputs are given a good, isolated chance of being published.
-	//
-	// TODO(yy): this would lead to conflict transactions as the same input
-	// can be used in two sweeping transactions, and our rebroadcaster will
-	// retry the failed one. We should instead understand why the input is
-	// failed in the first place, and start tracking input states in
-	// sweeper to avoid this.
-	var newInputs, retryInputs []txInput
-	for _, input := range cluster.inputs {
-		// Add input to the either one of the lists.
-		if input.publishAttempts == 0 {
-			newInputs = append(newInputs, input)
-		} else {
-			retryInputs = append(retryInputs, input)
-		}
-	}
-
-	// Convert the max fee rate's unit from sat/vb to sat/kw.
-	maxFeeRate := s.cfg.MaxFeeRate.FeePerKWeight()
-
-	// If there is anything to retry, combine it with the new inputs and
-	// form input sets.
-	var allSets []inputSet
-	if len(retryInputs) > 0 {
-		var err error
-		allSets, err = generateInputPartitionings(
-			append(retryInputs, newInputs...),
-			cluster.sweepFeeRate, maxFeeRate,
-			s.cfg.MaxInputsPerTx, s.cfg.Wallet,
-		)
-		if err != nil {
-			return nil, nil, fmt.Errorf("input partitionings: %w",
-				err)
-		}
-	}
-
-	// Create sets for just the new inputs.
-	newSets, err := generateInputPartitionings(
-		newInputs, cluster.sweepFeeRate, maxFeeRate,
-		s.cfg.MaxInputsPerTx, s.cfg.Wallet,
-	)
-	if err != nil {
-		return nil, nil, fmt.Errorf("input partitionings: %w", err)
-	}
-
-	log.Debugf("Sweep candidates at height=%v: total_num_pending=%v, "+
-		"total_num_new=%v", s.currentHeight, len(allSets), len(newSets))
-
-	return allSets, newSets, nil
-}
-
 // sweep takes a set of preselected inputs, creates a sweep tx and publishes the
 // tx. The output address is only marked as used if the publish succeeds.
-func (s *UtxoSweeper) sweep(inputs inputSet,
-	feeRate chainfee.SatPerKWeight) error {
-
+func (s *UtxoSweeper) sweep(set InputSet) error {
 	// Generate an output script if there isn't an unused script available.
 	if s.currentOutputScript == nil {
 		pkScript, err := s.cfg.GenSweepScript()
@@ -928,8 +777,9 @@ func (s *UtxoSweeper) sweep(inputs inputSet,
 
 	// Create sweep tx.
 	tx, fee, err := createSweepTx(
-		inputs, nil, s.currentOutputScript, uint32(s.currentHeight),
-		feeRate, s.cfg.MaxFeeRate.FeePerKWeight(), s.cfg.Signer,
+		set.Inputs(), nil, s.currentOutputScript,
+		uint32(s.currentHeight), set.FeeRate(),
+		s.cfg.MaxFeeRate.FeePerKWeight(), s.cfg.Signer,
 	)
 	if err != nil {
 		return fmt.Errorf("create sweep tx: %w", err)
@@ -937,7 +787,7 @@ func (s *UtxoSweeper) sweep(inputs inputSet,
 
 	tr := &TxRecord{
 		Txid:    tx.TxHash(),
-		FeeRate: uint64(feeRate),
+		FeeRate: uint64(set.FeeRate()),
 		Fee:     uint64(fee),
 	}
 
@@ -1306,6 +1156,8 @@ func (s *UtxoSweeper) handleUpdateReq(req *updateReq) (
 // - Make handling re-orgs easier.
 // - Thwart future possible fee sniping attempts.
 // - Make us blend in with the bitcoind wallet.
+//
+// TODO(yy): remove this method and only allow sweeping via requests.
 func (s *UtxoSweeper) CreateSweepTx(inputs []input.Input,
 	feePref FeeEstimateInfo) (*wire.MsgTx, error) {
 
@@ -1671,25 +1523,43 @@ func (s *UtxoSweeper) updateSweeperInputs() pendingInputs {
 // sweepPendingInputs is called when the ticker fires. It will create clusters
 // and attempt to create and publish the sweeping transactions.
 func (s *UtxoSweeper) sweepPendingInputs(inputs pendingInputs) {
-	// We'll attempt to cluster all of our inputs with similar fee rates.
-	// Before attempting to sweep them, we'll sort them in descending fee
-	// rate order. We do this to ensure any inputs which have had their fee
-	// rate bumped are broadcast first in order enforce the RBF policy.
-	inputClusters := s.cfg.Aggregator.ClusterInputs(inputs)
-	sort.Slice(inputClusters, func(i, j int) bool {
-		return inputClusters[i].sweepFeeRate >
-			inputClusters[j].sweepFeeRate
-	})
+	// Cluster all of our inputs based on the specific Aggregator.
+	sets := s.cfg.Aggregator.ClusterInputs(inputs)
 
-	for _, cluster := range inputClusters {
-		err := s.sweepCluster(cluster)
+	// sweepWithLock is a helper closure that executes the sweep within a
+	// coin select lock to prevent the coins being selected for other
+	// transactions like funding of a channel.
+	sweepWithLock := func(set InputSet) error {
+		return s.cfg.Wallet.WithCoinSelectLock(func() error {
+			// Try to add inputs from our wallet.
+			err := set.AddWalletInputs(s.cfg.Wallet)
+			if err != nil {
+				return err
+			}
+
+			// Create sweeping transaction for each set.
+			err = s.sweep(set)
+			if err != nil {
+				return err
+			}
+
+			return nil
+		})
+	}
+
+	for _, set := range sets {
+		var err error
+		if set.NeedWalletInput() {
+			// Sweep the set of inputs that need the wallet inputs.
+			err = sweepWithLock(set)
+		} else {
+			// Sweep the set of inputs that don't need the wallet
+			// inputs.
+			err = s.sweep(set)
+		}
+
 		if err != nil {
-			log.Errorf("input cluster sweep: %v", err)
+			log.Errorf("Sweep new inputs: %v", err)
 		}
 	}
-}
-
-// init initializes the random generator for random input rescheduling.
-func init() {
-	rand.Seed(time.Now().Unix())
 }

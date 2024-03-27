@@ -21,6 +21,7 @@ import (
 	lnmock "github.com/lightningnetwork/lnd/lntest/mock"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
+	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
 
@@ -29,7 +30,7 @@ var (
 
 	testMaxSweepAttempts = 3
 
-	testMaxInputsPerTx = 3
+	testMaxInputsPerTx = uint32(3)
 
 	defaultFeePref = Params{Fee: FeeEstimateInfo{ConfTarget: 1}}
 )
@@ -43,7 +44,8 @@ type sweeperTestContext struct {
 	backend   *mockBackend
 	store     SweeperStore
 
-	publishChan chan wire.MsgTx
+	publishChan   chan wire.MsgTx
+	currentHeight int32
 }
 
 var (
@@ -122,23 +124,24 @@ func createSweeperTestContext(t *testing.T) *sweeperTestContext {
 
 	aggregator := NewSimpleUtxoAggregator(
 		estimator, DefaultMaxFeeRate.FeePerKWeight(),
+		testMaxInputsPerTx,
 	)
 
 	ctx := &sweeperTestContext{
-		notifier:    notifier,
-		publishChan: backend.publishChan,
-		t:           t,
-		estimator:   estimator,
-		backend:     backend,
-		store:       store,
+		notifier:      notifier,
+		publishChan:   backend.publishChan,
+		t:             t,
+		estimator:     estimator,
+		backend:       backend,
+		store:         store,
+		currentHeight: mockChainHeight,
 	}
 
 	ctx.sweeper = New(&UtxoSweeperConfig{
-		Notifier:       notifier,
-		Wallet:         backend,
-		TickerDuration: 100 * time.Millisecond,
-		Store:          store,
-		Signer:         &lnmock.DummySigner{},
+		Notifier: notifier,
+		Wallet:   backend,
+		Store:    store,
+		Signer:   &lnmock.DummySigner{},
 		GenSweepScript: func() ([]byte, error) {
 			script := make([]byte, input.P2WPKHSize)
 			script[0] = 0
@@ -214,6 +217,11 @@ func (ctx *sweeperTestContext) assertNoTx() {
 
 func (ctx *sweeperTestContext) receiveTx() wire.MsgTx {
 	ctx.t.Helper()
+
+	// Every time we want to receive a tx, we send a new block epoch to the
+	// sweeper to trigger a sweeping action.
+	ctx.notifier.NotifyEpochNonBlocking(ctx.currentHeight + 1)
+
 	var tx wire.MsgTx
 	select {
 	case tx = <-ctx.publishChan:
@@ -1280,6 +1288,11 @@ func TestLockTimes(t *testing.T) {
 	// impact our test.
 	ctx.sweeper.cfg.MaxInputsPerTx = 100
 
+	// We also need to update the aggregator about this new config.
+	ctx.sweeper.cfg.Aggregator = NewSimpleUtxoAggregator(
+		ctx.estimator, DefaultMaxFeeRate.FeePerKWeight(), 100,
+	)
+
 	// We will set up the lock times in such a way that we expect the
 	// sweeper to divide the inputs into 4 diffeerent transactions.
 	const numSweeps = 4
@@ -1362,7 +1375,7 @@ func TestLockTimes(t *testing.T) {
 
 	// The should be no inputs not foud in any of the sweeps.
 	if len(inputs) != 0 {
-		t.Fatalf("had unsweeped inputs")
+		t.Fatalf("had unsweeped inputs: %v", inputs)
 	}
 
 	// Mine the first sweeps
@@ -1370,9 +1383,11 @@ func TestLockTimes(t *testing.T) {
 
 	// Results should all come back.
 	for i := range results {
-		result := <-results[i]
-		if result.Err != nil {
-			t.Fatal("expected input to be swept")
+		select {
+		case result := <-results[i]:
+			require.NoError(t, result.Err)
+		case <-time.After(1 * time.Second):
+			t.Fatalf("result %v did not come back", i)
 		}
 	}
 }
@@ -1775,6 +1790,10 @@ func TestRequiredTxOuts(t *testing.T) {
 				inputs[*op] = inp
 			}
 
+			// Send a new block epoch to trigger the sweeper to
+			// sweep the inputs.
+			ctx.notifier.NotifyEpoch(ctx.sweeper.currentHeight + 1)
+
 			// Check the sweeps transactions, ensuring all inputs
 			// are there, and all the locktimes are satisfied.
 			var sweeps []*wire.MsgTx
@@ -1869,115 +1888,6 @@ func TestSweeperShutdownHandling(t *testing.T) {
 		spendableInputs[0], defaultFeePref,
 	)
 	require.Error(t, err)
-}
-
-// TestGetInputLists checks that the expected input sets are returned based on
-// whether there are retried inputs or not.
-func TestGetInputLists(t *testing.T) {
-	t.Parallel()
-
-	// Create a test param with a dummy fee preference. This is needed so
-	// `feeRateForPreference` won't throw an error.
-	param := Params{Fee: FeeEstimateInfo{ConfTarget: 1}}
-
-	// Create a mock input and mock all the methods used in this test.
-	testInput := &input.MockInput{}
-	testInput.On("RequiredLockTime").Return(0, false)
-	testInput.On("WitnessType").Return(input.CommitmentAnchor)
-	testInput.On("OutPoint").Return(&wire.OutPoint{Index: 1})
-	testInput.On("RequiredTxOut").Return(nil)
-	testInput.On("UnconfParent").Return(nil)
-	testInput.On("SignDesc").Return(&input.SignDescriptor{
-		Output: &wire.TxOut{Value: 100_000},
-	})
-
-	// Create a new and a retried input.
-	//
-	// NOTE: we use the same input.Input for both pending inputs as we only
-	// test the logic of returning the correct non-nil input sets, and not
-	// the content the of sets. To validate the content of the sets, we
-	// should test `generateInputPartitionings` instead.
-	newInput := &pendingInput{
-		Input:  testInput,
-		params: param,
-	}
-	oldInput := &pendingInput{
-		Input:           testInput,
-		params:          param,
-		publishAttempts: 1,
-	}
-
-	// clusterNew contains only new inputs.
-	clusterNew := pendingInputs{
-		wire.OutPoint{Index: 1}: newInput,
-	}
-
-	// clusterMixed contains a mixed of new and retried inputs.
-	clusterMixed := pendingInputs{
-		wire.OutPoint{Index: 1}: newInput,
-		wire.OutPoint{Index: 2}: oldInput,
-	}
-
-	// clusterOld contains only retried inputs.
-	clusterOld := pendingInputs{
-		wire.OutPoint{Index: 2}: oldInput,
-	}
-
-	// Create a test sweeper.
-	s := New(&UtxoSweeperConfig{
-		MaxInputsPerTx: DefaultMaxInputsPerTx,
-	})
-
-	testCases := []struct {
-		name              string
-		cluster           inputCluster
-		expectedNilAllSet bool
-		expectNilNewSet   bool
-	}{
-		{
-			// When there are only new inputs, we'd expect the
-			// first returned set(allSets) to be empty.
-			name:              "new inputs only",
-			cluster:           inputCluster{inputs: clusterNew},
-			expectedNilAllSet: true,
-			expectNilNewSet:   false,
-		},
-		{
-			// When there are only retried inputs, we'd expect the
-			// second returned set(newSet) to be empty.
-			name:              "retried inputs only",
-			cluster:           inputCluster{inputs: clusterOld},
-			expectedNilAllSet: false,
-			expectNilNewSet:   true,
-		},
-		{
-			// When there are mixed inputs, we'd expect two sets
-			// are returned.
-			name:              "mixed inputs",
-			cluster:           inputCluster{inputs: clusterMixed},
-			expectedNilAllSet: false,
-			expectNilNewSet:   false,
-		},
-	}
-
-	for _, tc := range testCases {
-		tc := tc
-
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-
-			allSets, newSets, err := s.getInputLists(tc.cluster)
-			require.NoError(t, err)
-
-			if tc.expectNilNewSet {
-				require.Nil(t, newSets)
-			}
-
-			if tc.expectedNilAllSet {
-				require.Nil(t, allSets)
-			}
-		})
-	}
 }
 
 // TestMarkInputsPendingPublish checks that given a list of inputs with
@@ -2502,4 +2412,67 @@ func TestMarkInputFailed(t *testing.T) {
 
 	// Assert the state is updated.
 	require.Equal(t, StateFailed, pi.state)
+}
+
+// TestSweepPendingInputs checks that `sweepPendingInputs` correctly executes
+// its workflow based on the returned values from the interfaces.
+func TestSweepPendingInputs(t *testing.T) {
+	t.Parallel()
+
+	// Create a mock wallet and aggregator.
+	wallet := &MockWallet{}
+	aggregator := &mockUtxoAggregator{}
+
+	// Create a test sweeper.
+	s := New(&UtxoSweeperConfig{
+		Wallet:     wallet,
+		Aggregator: aggregator,
+	})
+
+	// Create an input set that needs wallet inputs.
+	setNeedWallet := &MockInputSet{}
+
+	// Mock this set to ask for wallet input.
+	setNeedWallet.On("NeedWalletInput").Return(true).Once()
+	setNeedWallet.On("AddWalletInputs", wallet).Return(nil).Once()
+
+	// Mock the wallet to require the lock once.
+	wallet.On("WithCoinSelectLock", mock.Anything).Return(nil).Once()
+
+	// Create an input set that doesn't need wallet inputs.
+	normalSet := &MockInputSet{}
+	normalSet.On("NeedWalletInput").Return(false).Once()
+
+	// Mock the methods used in `sweep`. This is not important for this
+	// unit test.
+	feeRate := chainfee.SatPerKWeight(1000)
+	setNeedWallet.On("Inputs").Return(nil).Once()
+	setNeedWallet.On("FeeRate").Return(feeRate).Once()
+	normalSet.On("Inputs").Return(nil).Once()
+	normalSet.On("FeeRate").Return(feeRate).Once()
+
+	// Make pending inputs for testing. We don't need real values here as
+	// the returned clusters are mocked.
+	pis := make(pendingInputs)
+
+	// Mock the aggregator to return the mocked input sets.
+	aggregator.On("ClusterInputs", pis).Return([]InputSet{
+		setNeedWallet, normalSet,
+	})
+
+	// Set change output script to an invalid value. This should cause the
+	// `createSweepTx` inside `sweep` to fail. This is done so we can
+	// terminate the method early as we are only interested in testing the
+	// workflow in `sweepPendingInputs`. We don't need to test `sweep` here
+	// as it should be tested in its own unit test.
+	s.currentOutputScript = []byte{1}
+
+	// Call the method under test.
+	s.sweepPendingInputs(pis)
+
+	// Assert mocked methods are called as expected.
+	wallet.AssertExpectations(t)
+	aggregator.AssertExpectations(t)
+	setNeedWallet.AssertExpectations(t)
+	normalSet.AssertExpectations(t)
 }

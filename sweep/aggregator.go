@@ -21,12 +21,106 @@ const (
 	DefaultFeeRateBucketSize = 10
 )
 
+// inputCluster is a helper struct to gather a set of pending inputs that
+// should be swept with the specified fee rate.
+type inputCluster struct {
+	lockTime     *uint32
+	sweepFeeRate chainfee.SatPerKWeight
+	inputs       pendingInputs
+}
+
+// createInputSets goes through the cluster's inputs and constructs sets of
+// inputs that can be used to generate a sweeping transaction. Each set
+// contains up to the configured maximum number of inputs. Negative yield
+// inputs are skipped.  No input sets with a total value after fees below the
+// dust limit are returned.
+func (c *inputCluster) createInputSets(maxFeeRate chainfee.SatPerKWeight,
+	maxInputs uint32) []InputSet {
+
+	// Turn the inputs into a slice so we can sort them.
+	inputList := make([]*pendingInput, 0, len(c.inputs))
+	for _, input := range c.inputs {
+		inputList = append(inputList, input)
+	}
+
+	// Yield is calculated as the difference between value and added fee
+	// for this input. The fee calculation excludes fee components that are
+	// common to all inputs, as those wouldn't influence the order. The
+	// single component that is differentiating is witness size.
+	//
+	// For witness size, the upper limit is taken. The actual size depends
+	// on the signature length, which is not known yet at this point.
+	calcYield := func(input *pendingInput) int64 {
+		size, _, err := input.WitnessType().SizeUpperBound()
+		if err != nil {
+			log.Errorf("Failed to get input weight: %v", err)
+
+			return 0
+		}
+
+		yield := input.SignDesc().Output.Value -
+			int64(c.sweepFeeRate.FeeForWeight(int64(size)))
+
+		return yield
+	}
+
+	// Sort input by yield. We will start constructing input sets starting
+	// with the highest yield inputs. This is to prevent the construction
+	// of a set with an output below the dust limit, causing the sweep
+	// process to stop, while there are still higher value inputs
+	// available. It also allows us to stop evaluating more inputs when the
+	// first input in this ordering is encountered with a negative yield.
+	sort.Slice(inputList, func(i, j int) bool {
+		// Because of the specific ordering and termination condition
+		// that is described above, we place force sweeps at the start
+		// of the list. Otherwise we can't be sure that they will be
+		// included in an input set.
+		if inputList[i].parameters().Force {
+			return true
+		}
+
+		return calcYield(inputList[i]) > calcYield(inputList[j])
+	})
+
+	// Select blocks of inputs up to the configured maximum number.
+	var sets []InputSet
+	for len(inputList) > 0 {
+		// Start building a set of positive-yield tx inputs under the
+		// condition that the tx will be published with the specified
+		// fee rate.
+		txInputs := newTxInputSet(c.sweepFeeRate, maxFeeRate, maxInputs)
+
+		// From the set of sweepable inputs, keep adding inputs to the
+		// input set until the tx output value no longer goes up or the
+		// maximum number of inputs is reached.
+		txInputs.addPositiveYieldInputs(inputList)
+
+		// If there are no positive yield inputs, we can stop here.
+		inputCount := len(txInputs.inputs)
+		if inputCount == 0 {
+			return sets
+		}
+
+		log.Infof("Candidate sweep set of size=%v (+%v wallet inputs),"+
+			" has yield=%v, weight=%v",
+			inputCount, len(txInputs.inputs)-inputCount,
+			txInputs.totalOutput()-txInputs.walletInputTotal,
+			txInputs.weightEstimate(true).weight())
+
+		sets = append(sets, txInputs)
+		inputList = inputList[inputCount:]
+	}
+
+	return sets
+}
+
 // UtxoAggregator defines an interface that takes a list of inputs and
 // aggregate them into groups. Each group is used as the inputs to create a
 // sweeping transaction.
 type UtxoAggregator interface {
-	// ClusterInputs takes a list of inputs and groups them into clusters.
-	ClusterInputs(pendingInputs) []inputCluster
+	// ClusterInputs takes a list of inputs and groups them into input
+	// sets. Each input set will be used to create a sweeping transaction.
+	ClusterInputs(pendingInputs) []InputSet
 }
 
 // SimpleAggregator aggregates inputs known by the Sweeper based on each
@@ -40,6 +134,11 @@ type SimpleAggregator struct {
 	// MaxFeeRate is the maximum fee rate allowed within the
 	// SimpleAggregator.
 	MaxFeeRate chainfee.SatPerKWeight
+
+	// MaxInputsPerTx specifies the default maximum number of inputs allowed
+	// in a single sweep tx. If more need to be swept, multiple txes are
+	// created and published.
+	MaxInputsPerTx uint32
 
 	// FeeRateBucketSize is the default size of fee rate buckets we'll use
 	// when clustering inputs into buckets with similar fee rates within
@@ -59,11 +158,12 @@ var _ UtxoAggregator = (*SimpleAggregator)(nil)
 
 // NewSimpleUtxoAggregator creates a new instance of a SimpleAggregator.
 func NewSimpleUtxoAggregator(estimator chainfee.Estimator,
-	max chainfee.SatPerKWeight) *SimpleAggregator {
+	max chainfee.SatPerKWeight, maxTx uint32) *SimpleAggregator {
 
 	return &SimpleAggregator{
 		FeeEstimator:      estimator,
 		MaxFeeRate:        max,
+		MaxInputsPerTx:    maxTx,
 		FeeRateBucketSize: DefaultFeeRateBucketSize,
 	}
 }
@@ -72,11 +172,7 @@ func NewSimpleUtxoAggregator(estimator chainfee.Estimator,
 // inputs known by the UtxoSweeper. It clusters inputs by
 // 1) Required tx locktime
 // 2) Similar fee rates.
-//
-// TODO(yy): remove this nolint once done refactoring.
-//
-//nolint:revive
-func (s *SimpleAggregator) ClusterInputs(inputs pendingInputs) []inputCluster {
+func (s *SimpleAggregator) ClusterInputs(inputs pendingInputs) []InputSet {
 	// We start by getting the inputs clusters by locktime. Since the
 	// inputs commit to the locktime, they can only be clustered together
 	// if the locktime is equal.
@@ -88,7 +184,23 @@ func (s *SimpleAggregator) ClusterInputs(inputs pendingInputs) []inputCluster {
 	// Since the inputs that we clustered by fee rate don't commit to a
 	// specific locktime, we can try to merge a locktime cluster with a fee
 	// cluster.
-	return zipClusters(lockTimeClusters, feeClusters)
+	clusters := zipClusters(lockTimeClusters, feeClusters)
+
+	sort.Slice(clusters, func(i, j int) bool {
+		return clusters[i].sweepFeeRate >
+			clusters[j].sweepFeeRate
+	})
+
+	// Now that we have the clusters, we can create the input sets.
+	var inputSets []InputSet
+	for _, cluster := range clusters {
+		sets := cluster.createInputSets(
+			s.MaxFeeRate, s.MaxInputsPerTx,
+		)
+		inputSets = append(inputSets, sets...)
+	}
+
+	return inputSets
 }
 
 // clusterByLockTime takes the given set of pending inputs and clusters those
