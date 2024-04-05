@@ -201,6 +201,8 @@ type InitFundingReserveMsg struct {
 	// channel that will be useful to our future selves.
 	Memo []byte
 
+	CustomChannelData []byte
+
 	// TapscriptRoot is the root of the tapscript tree that will be used to
 	// create the funding output. This is an optional field that should
 	// only be set for taproot channels,

@@ -16,6 +16,7 @@ import (
 	"github.com/lightningnetwork/lnd/keychain"
 	"github.com/lightningnetwork/lnd/lnwallet/chanfunding"
 	"github.com/lightningnetwork/lnd/lnwire"
+	"github.com/lightningnetwork/lnd/tlv"
 )
 
 // CommitmentType is an enum indicating the commitment type we should use for
@@ -422,6 +423,11 @@ func NewChannelReservation(capacity, localFundingAmt btcutil.Amount,
 		chanType |= channeldb.TapscriptRootBit
 	}
 
+	customBlob := fn.None[tlv.Blob]()
+	if len(req.CustomChannelData) > 0 {
+		customBlob = fn.Some(req.CustomChannelData)
+	}
+
 	return &ChannelReservation{
 		ourContribution: &ChannelContribution{
 			FundingAmount: ourBalance.ToSatoshis(),
@@ -456,6 +462,7 @@ func NewChannelReservation(capacity, localFundingAmt btcutil.Amount,
 			InitialRemoteBalance: theirBalance,
 			Memo:                 req.Memo,
 			TapscriptRoot:        req.TapscriptRoot,
+			CustomBlob:           customBlob,
 		},
 		pushMSat:      req.PushMSat,
 		pendingChanID: req.PendingChanID,
